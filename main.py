@@ -10,6 +10,7 @@ from config import *
 logging.basicConfig(filename=LOGS, level=logging.ERROR, format="%(asctime)s FILE: %(filename)s IN: %(funcName)s MESSAGE: %(message)s", filemode="w")
 bot = telebot.TeleBot(get_bot_token())
 
+
 # обрабатываем команду /start
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -27,6 +28,7 @@ def debug(message):
         bot.send_document(message.chat.id, f)
 
 
+# Обрабатываем команду /stt
 @bot.message_handler(commands=['stt'])
 def stt_handler(message):
     user_id = message.from_user.id
@@ -56,8 +58,9 @@ def stt(message):
 
     # Если статус True - отправляем текст сообщения и сохраняем в БД, иначе - сообщение об ошибке
     if status:
-        # Записываем сообщение и кол-во аудиоблоков в БД
-        insert_row(user_id, text, 'stt_blocks', stt_blocks)
+        # Подготавливаем данные для функции add_message
+        full_message = (text, 'stt_blocks', 0, 0, stt_blocks)
+        add_message(user_id, full_message)
         bot.send_message(user_id, text, reply_to_message_id=message.id)
     else:
         bot.send_message(user_id, text)
@@ -80,12 +83,14 @@ def tts(message):
         return
 
         # Считаем символы в тексте и проверяем сумму потраченных символов
-    text_symbol = is_tts_symbol_limit(message, text)
-    if text_symbol is None:
+    tts_symbols, error_message = is_tts_symbol_limit(user_id, text)
+    if tts_symbols is None:
+        bot.send_message(user_id, error_message)
         return
 
     # Записываем сообщение и кол-во символов в БД
-    insert_row(user_id, text, text_symbol)
+    full_message = (text, 'tts_symbols', 0, tts_symbols, 0)
+    add_message(user_id, full_message)
 
     # Получаем статус и содержимое ответа от SpeechKit
     status, content = text_to_speech(text)
@@ -95,51 +100,6 @@ def tts(message):
         bot.send_voice(user_id, content)
     else:
         bot.send_message(user_id, content)
-
-
-# проверяем, не превысил ли пользователь лимиты на преобразование аудио в текст
-def is_stt_block_limit(message, duration):
-    user_id = message.from_user.id
-
-    # Переводим секунды в аудиоблоки
-    audio_blocks = math.ceil(duration / 15) # округляем в большую сторону
-    # Функция из БД для подсчёта всех потраченных пользователем аудиоблоков
-    all_blocks = count_all_blocks(user_id) + audio_blocks
-
-    # Проверяем, что аудио длится меньше 30 секунд
-    if duration >= 30:
-        msg = "SpeechKit STT работает с голосовыми сообщениями меньше 30 секунд"
-        bot.send_message(user_id, msg)
-        return None
-
-    # Сравниваем all_blocks с количеством доступных пользователю аудиоблоков
-    if all_blocks >= MAX_USER_STT_BLOCKS:
-        msg = f"Превышен общий лимит SpeechKit STT {MAX_USER_STT_BLOCKS}. Использовано {all_blocks} блоков. Доступно: {MAX_USER_STT_BLOCKS - all_blocks}"
-        bot.send_message(user_id, msg)
-        return None
-
-    return audio_blocks
-
-
-def is_tts_symbol_limit(message, text):
-    user_id = message.from_user.id
-    text_symbols = len(text)
-
-    # Функция из БД для подсчёта всех потраченных пользователем символов
-    all_symbols = count_all_symbol(user_id) + text_symbols
-
-    # Сравниваем all_symbols с количеством доступных пользователю символов
-    if all_symbols >= MAX_USER_TTS_SYMBOLS:
-        msg = f"Превышен общий лимит SpeechKit TTS {MAX_USER_TTS_SYMBOLS}. Использовано: {all_symbols} символов. Доступно: {MAX_USER_TTS_SYMBOLS - all_symbols}"
-        bot.send_message(user_id, msg)
-        return None
-
-    # Сравниваем количество символов в тексте с максимальным количеством символов в тексте
-    if text_symbols >= MAX_TTS_SYMBOLS:
-        msg = f"Превышен лимит SpeechKit TTS на запрос {MAX_TTS_SYMBOLS}, в сообщении {text_symbols} символов"
-        bot.send_message(user_id, msg)
-        return None
-    return len(text)
 
 
 @bot.message_handler(content_types=['voice'])
@@ -155,7 +115,7 @@ def handle_voice(message: telebot.types.Message):
 
         # Проверка на доступность аудиоблоков
         stt_blocks, error_message = is_stt_block_limit(user_id, message.voice.duration)
-        if error_message:
+        if error_message is not None:  # Проверяем наличие ошибки
             bot.send_message(user_id, error_message)
             return
 
@@ -184,14 +144,13 @@ def handle_voice(message: telebot.types.Message):
             bot.send_message(user_id, answer_gpt)
             return
         total_gpt_tokens += tokens_in_answer
-
         # Проверка на лимит символов для SpeechKit
+
         tts_symbols, error_message = is_tts_symbol_limit(user_id, answer_gpt)
 
         # Запись ответа GPT в БД
         add_message(user_id=user_id, full_message=[answer_gpt, 'assistant', total_gpt_tokens, tts_symbols, 0])
-
-        if error_message:
+        if error_message is not None:  # Проверяем наличие ошибки
             bot.send_message(user_id, error_message)
             return
 
@@ -201,11 +160,9 @@ def handle_voice(message: telebot.types.Message):
             bot.send_voice(user_id, voice_response, reply_to_message_id=message.id)
         else:
             bot.send_message(user_id, answer_gpt, reply_to_message_id=message.id)
-
     except Exception as e:
         logging.error(e)
         bot.send_message(user_id, "Не получилось ответить. Попробуй записать другое сообщение")
-
 # обрабатываем текстовые сообщения
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
